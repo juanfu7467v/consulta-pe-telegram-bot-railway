@@ -17,6 +17,9 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").r
 SESSION_STRING = os.getenv("SESSION_STRING", None)
 PORT = int(os.getenv("PORT", 8080))  # Railway usa 8080 por defecto
 
+# Nombre fijo de la sesión
+SESSION_NAME = "consulta_pe_session"
+
 # Carpeta descargas
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -29,12 +32,12 @@ CORS(app)
 loop = asyncio.new_event_loop()
 
 # --- Telethon Client ---
-if SESSION_STRING and SESSION_STRING.strip() and SESSION_STRING != "consulta_pe_bot":
+if SESSION_STRING and SESSION_STRING.strip() and SESSION_STRING != SESSION_NAME:
     session = StringSession(SESSION_STRING)
     print("🔑 Usando SESSION_STRING desde variables de entorno")
 else:
-    session = "consulta_pe_bot"
-    print("📂 Usando sesión temporal (no persistente)")
+    session = SESSION_NAME
+    print(f"📂 Usando sesión fija: {SESSION_NAME}")
 
 client = TelegramClient(session, API_ID, API_HASH, loop=loop)
 
@@ -113,6 +116,7 @@ def root():
     return jsonify({
         "status": "ok",
         "public_url": PUBLIC_URL,
+        "TELEGRAM_SESSION": SESSION_NAME,
         "endpoints": {
             "/login?phone=+51...": "Solicita código",
             "/code?code=12345": "Confirma código",
@@ -129,18 +133,11 @@ def status():
     except Exception:
         is_auth = False
 
-    current_session = None
-    try:
-        if is_auth:
-            current_session = client.session.save()
-    except Exception:
-        pass
-
     return jsonify({
         "authorized": bool(is_auth),
         "pending_phone": pending_phone["phone"],
-        "session_loaded": True if SESSION_STRING else False,
-        "session_string": current_session
+        "session_loaded": True,
+        "session_string": SESSION_NAME  # 🔥 siempre fijo
     })
 
 @app.route("/login")
@@ -180,8 +177,7 @@ def code():
             await client.start()
             pending_phone["phone"] = None
             pending_phone["sent_at"] = None
-            new_string = client.session.save()
-            return {"status": "authenticated", "session_string": new_string}
+            return {"status": "authenticated", "session_string": SESSION_NAME}
         except errors.SessionPasswordNeededError:
             return {"status": "error", "error": "2FA requerido"}
         except Exception as e:
@@ -201,7 +197,7 @@ def send_msg():
         target = int(chat_id) if chat_id.isdigit() else chat_id
         entity = await client.get_entity(target)
         await client.send_message(entity, msg)
-        return {"status": "sent", "to": chat_id, "msg": msg}
+        return {"status": "sent", "to": chat_id, "msg": msg, "session": SESSION_NAME}
 
     try:
         result = run_coro(_send())
@@ -215,6 +211,7 @@ def get_msgs():
         data = list(messages)
     return jsonify({
         "message": "found data" if data else "no data",
+        "session": SESSION_NAME,
         "result": {
             "quantity": len(data),
             "coincidences": data
@@ -232,5 +229,5 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
+    print(f"🚀 App corriendo en http://0.0.0.0:{PORT} con sesión fija: {SESSION_NAME}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
