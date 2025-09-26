@@ -1,13 +1,13 @@
 import os
 import asyncio
 import threading
+import traceback
 from collections import deque
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
-import traceback
 import aiohttp
 
 # --- Config ---
@@ -17,18 +17,22 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").r
 SESSION_STRING = os.getenv("SESSION_STRING", None)
 PORT = int(os.getenv("PORT", 8080))
 
-# Carpeta descargas
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Flask
+# --- Flask app ---
 app = Flask(__name__)
 CORS(app)
 
-# Async loop
+# --- Async loop for Telethon ---
 loop = asyncio.new_event_loop()
+threading.Thread(target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()), daemon=True).start()
 
-# --- Telethon Client ---
+def run_coro(coro):
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result()
+
+# --- Setup Telegram Client ---
 if SESSION_STRING and SESSION_STRING.strip() and SESSION_STRING != "consulta_pe_bot":
     session = StringSession(SESSION_STRING)
     print("🔑 Usando SESSION_STRING desde variables de entorno")
@@ -45,79 +49,46 @@ _messages_lock = threading.Lock()
 # Login pendiente
 pending_phone = {"phone": None, "sent_at": None}
 
-# --- Loop en thread ---
-def _loop_thread():
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
+# Limpieza de cabecera y pie
+def clean_message_text(raw_text: str) -> str:
+    """
+    Intenta eliminar cabecera y pie si coinciden con los patrones esperados.
+    Si no coincide, retorna el texto sin modificaciones.
+    """
+    if not raw_text:
+        return raw_text
 
-threading.Thread(target=_loop_thread, daemon=True).start()
+    text = raw_text
 
-# --- Ejecutar coroutines ---
-def run_coro(coro):
-    fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    return fut.result()
+    # Eliminar los posibles encabezados
+    # Ej: “[#LEDER_BOT] → RENIEC NOMBRES [PREMIUM]Se encontro 1 resultado.”  
+    # Usaremos una expresión para detectar ese encabezado
+    header_pattern = r"^\s*\[\#LEDER_BOT\].*?resultado\.\s*"
+    import re
+    text = re.sub(header_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
 
-# --- Reconexión automática + ping ---
-async def _ensure_connected():
-    while True:
-        try:
-            if not client.is_connected():
-                await client.connect()
-                print("🔌 Reconectando Telethon...")
-            if await client.is_user_authorized():
-                print("✅ Cliente autorizado")
-        except Exception:
-            traceback.print_exc()
+    # Eliminar el pie
+    # Ej: “↞ Puedes visualizar la foto de una coincidencia antes de usar /dni ↠ Credits : 1478Wanted for : Cevelinda”
+    footer_pattern = r"↞.*|Credits\s*:.+|Wanted for\s*:.+"
+    text = re.sub(footer_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
 
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(f"{PUBLIC_URL}/status") as resp:
-                    await resp.text()
-        except Exception:
-            pass
+    # Limpiar espacios sobrantes al inicio / final
+    return text.strip()
 
-        await asyncio.sleep(300)
-
-asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
-
-# --- Función para limpiar mensajes ---
-def limpiar_mensaje(texto: str) -> str:
-    if not texto:
-        return ""
-    lines = texto.splitlines()
-    cleaned = []
-    inside_main = False
-    for line in lines:
-        line_strip = line.strip()
-        # Ignorar cabecera
-        if "#LEDER_BOT" in line_strip and "RENIEC NOMBRES" in line_strip:
-            inside_main = True
-            continue
-        # Ignorar pie
-        if any(p in line_strip for p in ["Puedes visualizar la foto", "Credits", "Wanted for"]):
-            inside_main = False
-            continue
-        if inside_main or (not line_strip.startswith("#") and line_strip != ""):
-            cleaned.append(line_strip)
-    return "\n".join(cleaned).strip()
-
-# --- Handler mensajes ---
 async def _on_new_message(event):
     try:
+        raw_text = event.raw_text or ""
+        cleaned = clean_message_text(raw_text)
+
         msg_obj = {
             "chat_id": getattr(event, "chat_id", None),
             "from_id": event.sender_id,
             "date": event.message.date.isoformat() if getattr(event, "message", None) else datetime.utcnow().isoformat(),
-            "raw_message": event.raw_text or ""
+            # “message” será siempre el texto limpio
+            "message": cleaned
         }
 
-        # Limpiar solo si contiene la marca
-        if "#LEDER_BOT" in msg_obj["raw_message"] and "RENIEC NOMBRES" in msg_obj["raw_message"]:
-            msg_obj["message"] = limpiar_mensaje(msg_obj["raw_message"])
-        else:
-            msg_obj["message"] = msg_obj["raw_message"]
-
-        # Descarga media si existe
+        # Si tiene media, bajar e incluir URL
         if getattr(event, "message", None) and getattr(event.message, "media", None):
             try:
                 saved_path = await event.download_media(file=DOWNLOAD_DIR)
@@ -129,13 +100,28 @@ async def _on_new_message(event):
         with _messages_lock:
             messages.appendleft(msg_obj)
 
-        print("📥 Nuevo mensaje:", msg_obj)
+        print("📥 Nuevo mensaje interceptado:", msg_obj)
     except Exception:
         traceback.print_exc()
 
 client.add_event_handler(_on_new_message, events.NewMessage(incoming=True))
 
-# ------------------- Rutas HTTP -------------------
+# (Opcional) rutina de reconexión / ping
+async def _ensure_connected():
+    while True:
+        try:
+            if not client.is_connected():
+                await client.connect()
+                print("🔌 Reconectando Telethon...")
+            if await client.is_user_authorized():
+                pass
+        except Exception:
+            traceback.print_exc()
+        await asyncio.sleep(300)
+
+asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
+
+# --- Rutas HTTP ---
 
 @app.route("/")
 def root():
@@ -147,7 +133,7 @@ def root():
             "/code?code=12345": "Confirma código",
             "/send?chat_id=@user&msg=hola": "Enviar mensaje",
             "/get": "Obtener mensajes",
-            "/files/<filename>": "Descargar archivos"
+            "/files/": "Descargar archivos"
         }
     })
 
@@ -242,7 +228,6 @@ def send_msg():
 def get_msgs():
     with _messages_lock:
         data = list(messages)
-    # Retorna todos los mensajes ya limpios
     return jsonify({
         "message": "found data" if data else "no data",
         "result": {
@@ -255,12 +240,10 @@ def get_msgs():
 def files(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=False)
 
-# ------------------- Run -------------------
 if __name__ == "__main__":
     try:
         run_coro(client.connect())
     except Exception:
         pass
-
     print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
