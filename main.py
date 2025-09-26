@@ -6,17 +6,16 @@ from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from telethon import TelegramClient, events, errors
+from telethon.sessions import StringSession
 import traceback
 import aiohttp
 
-# --- Configuración ---
+# --- Config ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").rstrip("/")
-PORT = int(os.getenv("PORT", 8080))  # Railway usa 8080 por defecto
-
-# Nombre fijo de la sesión
-SESSION_NAME = "consulta_pe_session"
+SESSION_STRING = os.getenv("SESSION_STRING", None)
+PORT = int(os.getenv("PORT", 8080))
 
 # Carpeta descargas
 DOWNLOAD_DIR = "downloads"
@@ -29,8 +28,15 @@ CORS(app)
 # Async loop
 loop = asyncio.new_event_loop()
 
-# --- Cliente Telethon ---
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH, loop=loop)
+# --- Telethon Client ---
+if SESSION_STRING and SESSION_STRING.strip() and SESSION_STRING != "consulta_pe_bot":
+    session = StringSession(SESSION_STRING)
+    print("🔑 Usando SESSION_STRING desde variables de entorno")
+else:
+    session = "consulta_pe_bot"
+    print("📂 Usando sesión temporal (no persistente)")
+
+client = TelegramClient(session, API_ID, API_HASH, loop=loop)
 
 # Mensajes en memoria
 messages = deque(maxlen=2000)
@@ -74,6 +80,27 @@ async def _ensure_connected():
 
 asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
 
+# --- Función para limpiar mensajes ---
+def limpiar_mensaje(texto: str) -> str:
+    if not texto:
+        return ""
+    lines = texto.splitlines()
+    cleaned = []
+    inside_main = False
+    for line in lines:
+        line_strip = line.strip()
+        # Ignorar cabecera
+        if "#LEDER_BOT" in line_strip and "RENIEC NOMBRES" in line_strip:
+            inside_main = True
+            continue
+        # Ignorar pie
+        if any(p in line_strip for p in ["Puedes visualizar la foto", "Credits", "Wanted for"]):
+            inside_main = False
+            continue
+        if inside_main or (not line_strip.startswith("#") and line_strip != ""):
+            cleaned.append(line_strip)
+    return "\n".join(cleaned).strip()
+
 # --- Handler mensajes ---
 async def _on_new_message(event):
     try:
@@ -81,8 +108,16 @@ async def _on_new_message(event):
             "chat_id": getattr(event, "chat_id", None),
             "from_id": event.sender_id,
             "date": event.message.date.isoformat() if getattr(event, "message", None) else datetime.utcnow().isoformat(),
-            "message": event.raw_text or ""
+            "raw_message": event.raw_text or ""
         }
+
+        # Limpiar solo si contiene la marca
+        if "#LEDER_BOT" in msg_obj["raw_message"] and "RENIEC NOMBRES" in msg_obj["raw_message"]:
+            msg_obj["message"] = limpiar_mensaje(msg_obj["raw_message"])
+        else:
+            msg_obj["message"] = msg_obj["raw_message"]
+
+        # Descarga media si existe
         if getattr(event, "message", None) and getattr(event.message, "media", None):
             try:
                 saved_path = await event.download_media(file=DOWNLOAD_DIR)
@@ -133,7 +168,7 @@ def status():
     return jsonify({
         "authorized": bool(is_auth),
         "pending_phone": pending_phone["phone"],
-        "session_file": SESSION_NAME,
+        "session_loaded": True if SESSION_STRING else False,
         "session_string": current_session
     })
 
@@ -175,7 +210,7 @@ def code():
             pending_phone["phone"] = None
             pending_phone["sent_at"] = None
             new_string = client.session.save()
-            return {"status": "authenticated", "session_file": SESSION_NAME, "session_string": new_string}
+            return {"status": "authenticated", "session_string": new_string}
         except errors.SessionPasswordNeededError:
             return {"status": "error", "error": "2FA requerido"}
         except Exception as e:
@@ -207,6 +242,7 @@ def send_msg():
 def get_msgs():
     with _messages_lock:
         data = list(messages)
+    # Retorna todos los mensajes ya limpios
     return jsonify({
         "message": "found data" if data else "no data",
         "result": {
