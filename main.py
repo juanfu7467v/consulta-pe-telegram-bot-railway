@@ -105,6 +105,7 @@ async def _on_new_message(event):
             "date": event.message.date.isoformat()
             if getattr(event, "message", None)
             else datetime.utcnow().isoformat(),
+            # Siempre JSON limpio
             "message": cleaned["text"],
             "fields": cleaned["fields"],
         }
