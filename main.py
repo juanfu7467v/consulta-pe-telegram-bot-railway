@@ -18,7 +18,7 @@ from telethon.tl.types import PeerUser
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 from telethon.errors.rpcerrorlist import UserBlockedError
 
-# --- Configuración ---
+# --- Configuración Base ---
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -29,15 +29,18 @@ PORT = int(os.getenv("PORT", 8080))
 # --- Configuración de GitHub para Persistencia ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO") # Formato: usuario/repositorio
-SESSION_FILE_PATH = "session_data.txt" # 👈 RUTA DE SESIÓN ACTUALIZADA
-CACHE_DIR = "storage/cache/" # Directorio para guardar los archivos de caché
+
+# Archivo de Sesión: Se guarda en la raíz del repositorio de GitHub
+SESSION_FILE_PATH = "session_data.txt" 
+# Prefijo para la ubicación de los archivos de caché dentro del repositorio de GitHub
+CACHE_REPO_PATH_PREFIX = "storage/cache/" 
 
 if not GITHUB_TOKEN or not GITHUB_REPO:
-    print("⚠️ WARNING: GITHUB_TOKEN y/o GITHUB_REPO no están configurados. La persistencia en GitHub y el caché no funcionarán.")
+    print("⚠️ WARNING: GITHUB_TOKEN y/o GITHUB_REPO no están configurados. La persistencia en GitHub y el caché NO funcionarán.")
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(CACHE_DIR, exist_ok=True)
+
 
 # El chat ID/nombre del bot al que enviar los comandos (BOT PRINCIPAL)
 LEDERDATA_BOT_ID = "@LEDERDATA_OFC_BOT" 
@@ -110,7 +113,7 @@ def _get_file_sha(filepath: str, repo_slug: str, token: str):
         return None
 
 def _write_file_to_github(filepath: str, content: str, commit_message: str, repo_slug: str, token: str):
-    """Escribe o actualiza un archivo en GitHub."""
+    """Escribe o actualiza un archivo en GitHub. Filepath es la ruta DENTRO del repo."""
     if not token or not repo_slug: 
         print("Error: GITHUB_TOKEN o GITHUB_REPO no configurados para escribir en GitHub.")
         return False
@@ -144,7 +147,7 @@ def _write_file_to_github(filepath: str, content: str, commit_message: str, repo
         return False
 
 def _read_file_from_github(filepath: str, repo_slug: str, token: str):
-    """Lee un archivo desde GitHub y retorna su contenido."""
+    """Lee un archivo desde GitHub y retorna su contenido. Filepath es la ruta DENTRO del repo."""
     if not token or not repo_slug: return None
     url = f"https://api.github.com/repos/{repo_slug}/contents/{filepath}"
     headers = _get_github_headers(token)
@@ -182,7 +185,7 @@ def load_session_from_github():
         SESSION_STRING = content.strip()
         print("🔑 Session string loaded successfully from GitHub.")
     else:
-        print("Session file not found or empty in GitHub.")
+        print("Session file not found or empty in GitHub. Proceeding with login/new session.")
 
 def save_session_to_github(session_str: str):
     """Guarda la cadena de sesión de Telegram en GitHub."""
@@ -201,24 +204,24 @@ def save_session_to_github(session_str: str):
 
 # --- Lógica de Caché de API (Lectura y Escritura) ---
 
-def _get_cache_filepath(command: str) -> str:
-    """Genera la ruta del archivo de caché basado en el comando."""
+def _get_cache_filepath_in_repo(command: str) -> str:
+    """Genera la ruta completa del archivo de caché en GitHub basado en el comando."""
     # Normalizar el comando para un nombre de archivo seguro
     filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', command).lower()
     # Limitar la longitud del nombre de archivo
     if len(filename) > 200:
         filename = filename[:200]
-    return f"{CACHE_DIR}{filename}.json"
+    # Retorna la ruta DENTRO del repositorio
+    return f"{CACHE_REPO_PATH_PREFIX}{filename}.json"
 
 def get_cached_result(command: str):
     """Busca un resultado en el caché de GitHub."""
     if not GITHUB_TOKEN or not GITHUB_REPO: return None
     
-    filepath = _get_cache_filepath(command)
-    cache_path_in_repo = filepath.lstrip(CACHE_DIR).replace("//", "/") # Quitar el prefijo local
+    filepath = _get_cache_filepath_in_repo(command)
     
     # 1. Leer desde GitHub
-    content = _read_file_from_github(cache_path_in_repo, GITHUB_REPO, GITHUB_TOKEN)
+    content = _read_file_from_github(filepath, GITHUB_REPO, GITHUB_TOKEN)
     
     if content:
         try:
@@ -239,15 +242,14 @@ def save_result_to_cache(command: str, result: dict):
         print("Skipping cache save: GITHUB_TOKEN/GITHUB_REPO not set.")
         return
         
-    filepath = _get_cache_filepath(command)
-    cache_path_in_repo = filepath.lstrip(CACHE_DIR).replace("//", "/")
+    filepath = _get_cache_filepath_in_repo(command)
     
     # 1. Serializar el resultado a JSON
     content = json.dumps(result, indent=4)
     
     # 2. Escribir a GitHub
     _write_file_to_github(
-        cache_path_in_repo, 
+        filepath, 
         content, 
         f"Cache: Resultado automático para comando {command}", 
         GITHUB_REPO, 
@@ -685,6 +687,7 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
 
 async def _ensure_connected():
     """Mantiene la conexión y autorización activa, y guarda la sesión si es nueva."""
+    global SESSION_STRING # Necesario para actualizar la string global
     while True:
         try:
             if not client.is_connected():
@@ -703,8 +706,11 @@ async def _ensure_connected():
                         # Si la sesión es ahora un StringSession y no estaba guardada, la guardamos
                         if isinstance(client.session, StringSession):
                             new_string = client.session.save()
-                            if new_string != SESSION_STRING: # Guardar solo si es una sesión nueva/actualizada
+                            # 🚨 Revisión crítica: Guardar solo si es una sesión nueva/actualizada 
+                            if new_string != SESSION_STRING: 
                                 save_session_to_github(new_string)
+                                SESSION_STRING = new_string # Actualizar la variable global
+                                print("🔑 Sesión actualizada y guardada en GitHub desde _ensure_connected.")
 
                  except Exception:
                      pass
@@ -758,7 +764,7 @@ def status():
     return jsonify({
         "authorized": bool(is_auth),
         "pending_phone": pending_phone["phone"],
-        "session_loaded": bool(SESSION_STRING),
+        "session_loaded_at_startup": bool(SESSION_STRING),
         "session_string_saved_to_github": bool(current_session), # Indica si se generó una string
         "bot_status": bot_status,
         "hibernating": is_hibernating,
@@ -785,6 +791,7 @@ def login():
 
 @app.route("/code")
 def code():
+    global SESSION_STRING # Necesario para actualizar la string global
     code = request.args.get("code")
     if not code: return jsonify({"error": "Falta parámetro code"}), 400
     if not pending_phone["phone"]: return jsonify({"error": "No hay login pendiente"}), 400
@@ -800,6 +807,7 @@ def code():
             # OBTENER y GUARDAR la nueva StringSession en GitHub
             new_string = client.session.save()
             save_session_to_github(new_string) 
+            SESSION_STRING = new_string # Actualizar la variable global
             
             return {"status": "authenticated", "session_string": new_string, "saved_to_github": True}
         except errors.SessionPasswordNeededError: return {"status": "error", "error": "2FA requerido"}
@@ -839,10 +847,7 @@ def get_msgs():
 
 @app.route("/files/<path:filename>")
 def files(filename):
-    """
-    Ruta para descargar archivos. Se añade as_attachment=True para forzar la descarga 
-    en lugar de visualizar el archivo, lo que es ideal para appcreator24.
-    """
+    """Ruta para descargar archivos."""
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
 
@@ -1061,11 +1066,13 @@ if __name__ == "__main__":
              current_session_string = client.session.save()
              if current_session_string != SESSION_STRING:
                  save_session_to_github(current_session_string)
-
+                 SESSION_STRING = current_session_string # Actualizar la variable global
+             
+        # Verificación de que los bots existen
         run_coro(client.get_entity(LEDERDATA_BOT_ID)) 
         run_coro(client.get_entity(LEDERDATA_BACKUP_BOT_ID)) 
     except Exception:
         pass
+        
     print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
-
