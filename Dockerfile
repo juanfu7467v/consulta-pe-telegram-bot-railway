@@ -24,4 +24,6 @@ COPY . .
 # Crear el directorio de descargas si no existe y asegurar permisos
 RUN mkdir -p /app/downloads
 
-# El comando de inicio está en Procfile (gunicorn main:app), no necesitamos CMD aquí.
+# Define el comando que se ejecutará al iniciar el contenedor. 
+# Esto reemplaza el comando por defecto 'python3' que estaba fallando.
+CMD ["gunicorn", "main:app", "--bind", "0.0.0.0:8080"]
