@@ -6,7 +6,7 @@ import traceback
 import time
 import json
 import base64
-import requests # Necesario para la API de GitHub
+import requests 
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from urllib.parse import unquote
@@ -29,7 +29,7 @@ PORT = int(os.getenv("PORT", 8080))
 # --- Configuración de GitHub para Persistencia ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO") # Formato: usuario/repositorio
-SESSION_FILE_PATH = "storage/telethon_session.txt" # Ruta para guardar la sesión
+SESSION_FILE_PATH = "session_data.txt" # 👈 RUTA DE SESIÓN ACTUALIZADA
 CACHE_DIR = "storage/cache/" # Directorio para guardar los archivos de caché
 
 if not GITHUB_TOKEN or not GITHUB_REPO:
@@ -48,6 +48,39 @@ ALL_BOT_IDS = [LEDERDATA_BOT_ID, LEDERDATA_BACKUP_BOT_ID]
 TIMEOUT_FAILOVER = 25 
 TIMEOUT_TOTAL = 40 
 
+# --- Lógica de Hibernación (Sleep) ---
+# Tiempo en segundos para considerar inactividad (1 minuto)
+INACTIVITY_TIMEOUT = 60 
+# Tiempo que el proceso "dormirá" después de la inactividad (5 minutos)
+HIBERNATION_DURATION = 300 
+
+last_traffic_time = time.time()
+is_hibernating = False
+hibernation_lock = threading.Lock()
+
+def sleep_monitor():
+    """Verifica la inactividad y hace que el servidor "duerma"."""
+    global last_traffic_time, is_hibernating
+    while True:
+        time.sleep(30) # Comprobar cada 30 segundos
+        
+        with hibernation_lock:
+            if is_hibernating:
+                print(f"😴 Durmiendo...")
+                time.sleep(HIBERNATION_DURATION) # Permanece dormido por el periodo
+                is_hibernating = False
+                print("⚡️ Despertando...")
+                last_traffic_time = time.time() # Resetear al despertar
+                continue
+
+            current_time = time.time()
+            inactivity_duration = current_time - last_traffic_time
+            
+            if inactivity_duration > INACTIVITY_TIMEOUT:
+                # El servidor entrará en "hibernación" en la próxima iteración del bucle
+                print(f"💤 Detectada inactividad por {int(inactivity_duration)}s. Hibernando por {HIBERNATION_DURATION}s.")
+                is_hibernating = True
+                
 # --- Utilidades de GitHub ---
 
 def _get_github_headers(token: str):
@@ -256,6 +289,17 @@ def record_bot_failure(bot_id: str):
 app = Flask(__name__)
 CORS(app)
 
+# --- Middleware para el Monitor de Tráfico y Hibernación ---
+@app.before_request
+def update_traffic_time():
+    global last_traffic_time, is_hibernating
+    with hibernation_lock:
+        if is_hibernating:
+            # Si se recibe una solicitud mientras está hibernando, se "despierta"
+            is_hibernating = False
+            print("⚡️ Despertado por tráfico HTTP.")
+        last_traffic_time = time.time()
+        
 # --- Bucle Asíncrono para Telethon ---
 
 loop = asyncio.new_event_loop()
@@ -717,6 +761,8 @@ def status():
         "session_loaded": bool(SESSION_STRING),
         "session_string_saved_to_github": bool(current_session), # Indica si se generó una string
         "bot_status": bot_status,
+        "hibernating": is_hibernating,
+        "last_traffic": datetime.fromtimestamp(last_traffic_time).isoformat()
     })
 
 @app.route("/login")
@@ -999,6 +1045,12 @@ def api_venezolanos_nombres():
 # ----------------------------------------------------------------------
 
 if __name__ == "__main__":
+    
+    # 1. Iniciar el monitor de sueño
+    sleep_monitor_thread = threading.Thread(target=sleep_monitor, daemon=True)
+    sleep_monitor_thread.start()
+    
+    # 2. Conexión de Telethon
     try:
         run_coro(client.connect())
         if not run_coro(client.is_user_authorized()):
@@ -1016,3 +1068,4 @@ if __name__ == "__main__":
         pass
     print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
+
