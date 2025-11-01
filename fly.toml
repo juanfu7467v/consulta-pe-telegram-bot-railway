@@ -4,7 +4,7 @@
 #
 
 app = "consulta-pe-telegram-bot-railway"
-primary_region = "lim" # Región primaria (Lima)
+primary_region = "gru" # Región primaria (Lima)
 
 # [build] # <-- SECCIÓN ELIMINADA para que Fly.io use el Dockerfile
 #   builder = "paketobuildpacks/builder-jammy-base"
