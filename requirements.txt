@@ -1,3 +1,5 @@
+requests
+pygithub
 flask
 flask-cors
 telethon
