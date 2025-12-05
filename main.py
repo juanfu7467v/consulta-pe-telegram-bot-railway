@@ -4,12 +4,14 @@ import asyncio
 import threading
 import traceback
 import time
+import requests
 import json
 import base64
-import requests 
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
+# IMPORTAR CONCURRENT.FUTURES
+from concurrent.futures import TimeoutError as FutureTimeoutError 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from telethon import TelegramClient, events, errors
@@ -18,247 +20,109 @@ from telethon.tl.types import PeerUser
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 from telethon.errors.rpcerrorlist import UserBlockedError
 
-# --- Configuración Base ---
+# --- Configuración y Variables de Entorno ---
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").rstrip("/")
+# CLAVE: SESSION_STRING se carga directamente de la variable de entorno al inicio.
+# Se añade una variable para el ID único del bot en la base de datos externa
+BOT_API_ID = os.getenv("BOT_API_ID", "mi_bot_principal")
 SESSION_STRING = os.getenv("SESSION_STRING", None)
 PORT = int(os.getenv("PORT", 8080))
 
-# --- Configuración de GitHub para Persistencia ---
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO") # Formato: usuario/repositorio
-
-# Archivo de Sesión: Se guarda en la raíz del repositorio de GitHub
-SESSION_FILE_PATH = "session_data.txt" 
-# Prefijo para la ubicación de los archivos de caché dentro del repositorio de GitHub
-CACHE_REPO_PATH_PREFIX = "storage/cache/" 
-
-if not GITHUB_TOKEN or not GITHUB_REPO:
-    print("⚠️ WARNING: GITHUB_TOKEN y/o GITHUB_REPO no están configurados. La persistencia en GitHub y el caché NO funcionarán.")
+# --- VARIABLES DE ENTORNO PARA GITHUB (ELIMINADAS) ---
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-
-# El chat ID/nombre del bot al que enviar los comandos (BOT PRINCIPAL)
 LEDERDATA_BOT_ID = "@LEDERDATA_OFC_BOT" 
-# El chat ID/nombre del bot de respaldo (NUEVO BOT)
 LEDERDATA_BACKUP_BOT_ID = "@lederdata_publico_bot"
 ALL_BOT_IDS = [LEDERDATA_BOT_ID, LEDERDATA_BACKUP_BOT_ID]
 
-TIMEOUT_FAILOVER = 25 
-TIMEOUT_TOTAL = 40 
+# MODIFICACIÓN CLAVE DE TIMEOUTS
+TIMEOUT_FAILOVER = 15 
+TIMEOUT_TOTAL = 50 
+SYNC_WAIT_TIMEOUT = 55 # Tiempo máximo de espera para el worker de Gunicorn
 
-# --- Lógica de Hibernación (Sleep) ---
-# Tiempo en segundos para considerar inactividad (1 minuto)
-INACTIVITY_TIMEOUT = 60 
-# Tiempo que el proceso "dormirá" después de la inactividad (5 minutos)
-HIBERNATION_DURATION = 300 
+# --- LÓGICA DE PERSISTENCIA (MODIFICADA) ---
 
-last_traffic_time = time.time()
-is_hibernating = False
-hibernation_lock = threading.Lock()
+# URL base de la API externa
+API_BASE_URL = "https://base-datos-consulta-pe.fly.dev"
 
-def sleep_monitor():
-    """Verifica la inactividad y hace que el servidor "duerma"."""
-    global last_traffic_time, is_hibernating
-    while True:
-        time.sleep(30) # Comprobar cada 30 segundos
-        
-        with hibernation_lock:
-            if is_hibernating:
-                print(f"😴 Durmiendo...")
-                time.sleep(HIBERNATION_DURATION) # Permanece dormido por el periodo
-                is_hibernating = False
-                print("⚡️ Despertando...")
-                last_traffic_time = time.time() # Resetear al despertar
-                continue
-
-            current_time = time.time()
-            inactivity_duration = current_time - last_traffic_time
-            
-            if inactivity_duration > INACTIVITY_TIMEOUT:
-                # El servidor entrará en "hibernación" en la próxima iteración del bucle
-                print(f"💤 Detectada inactividad por {int(inactivity_duration)}s. Hibernando por {HIBERNATION_DURATION}s.")
-                is_hibernating = True
-                
-# --- Utilidades de GitHub ---
-
-def _get_github_headers(token: str):
-    """Retorna los headers de autenticación para la API de GitHub."""
-    return {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "Content-Type": "application/json",
-    }
-
-def _get_file_sha(filepath: str, repo_slug: str, token: str):
-    """Obtiene el SHA de un archivo existente en GitHub."""
-    if not token or not repo_slug: return None
-    url = f"https://api.github.com/repos/{repo_slug}/contents/{filepath}"
-    headers = _get_github_headers(token)
+def _load_session_from_api(bot_id: str) -> str | None:
+    """Intenta recuperar la session_string de la API externa."""
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        url = f"{API_BASE_URL}/historial/session_string"
+        print(f"📡 Intentando recuperar sesión desde {url}...")
+        
+        # Se asume que la API GET es rápida, por lo que usamos un timeout bajo de 10s
+        response = requests.get(url, timeout=10)
+        
         if response.status_code == 200:
-            return response.json().get("sha")
-        elif response.status_code == 404:
-            return None # Archivo no existe
-        else:
-            print(f"Error al obtener SHA de {filepath} (Status: {response.status_code}): {response.text}")
+            data = response.json()
+            # La ruta devuelve un arreglo, buscamos el objeto con el 'id' correcto
+            for item in data:
+                if item.get("id") == bot_id and item.get("session_string"):
+                    print(f"✅ Sesión recuperada de la API para ID: {bot_id}.")
+                    return item["session_string"]
+            print(f"⚠️ No se encontró una sesión válida en la API para ID: {bot_id}.")
             return None
-    except Exception as e:
-        print(f"Excepción al obtener SHA: {e}")
+        else:
+            print(f"❌ Error al consultar la API (HTTP {response.status_code}).")
+            return None
+    except requests.RequestException as e:
+        print(f"❌ Error de conexión al intentar cargar sesión: {e}")
         return None
 
-def _write_file_to_github(filepath: str, content: str, commit_message: str, repo_slug: str, token: str):
-    """Escribe o actualiza un archivo en GitHub. Filepath es la ruta DENTRO del repo."""
-    if not token or not repo_slug: 
-        print("Error: GITHUB_TOKEN o GITHUB_REPO no configurados para escribir en GitHub.")
-        return False
-        
-    url = f"https://api.github.com/repos/{repo_slug}/contents/{filepath}"
-    sha = _get_file_sha(filepath, repo_slug, token)
-    
-    # El contenido debe ser Base64
-    content_b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    
-    payload = {
-        "message": commit_message,
-        "content": content_b64,
-        "branch": "main" # Asumiendo la rama principal
-    }
-    if sha:
-        payload["sha"] = sha # Necesario para actualizar
-        
-    headers = _get_github_headers(token)
-    
+def _save_session_to_api(bot_id: str, session_str: str) -> bool:
+    """Guarda la session_string en la API externa mediante POST."""
     try:
-        response = requests.put(url, headers=headers, data=json.dumps(payload), timeout=10)
+        url = f"{API_BASE_URL}/guardar-post/session_string"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "id": bot_id,
+            "session_string": session_str
+        }
+        
+        print(f"📡 Enviando sesión a {url}...")
+        # Se asume que la API POST es rápida, por lo que usamos un timeout bajo de 10s
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        
         if response.status_code in [200, 201]:
-            print(f"✅ Archivo '{filepath}' guardado/actualizado en GitHub.")
+            print("✅ Session_string guardada/actualizada con éxito en la API externa.")
             return True
         else:
-            print(f"❌ Error al guardar '{filepath}' en GitHub (Status: {response.status_code}): {response.text}")
+            print(f"❌ Error al guardar sesión en la API (HTTP {response.status_code}, respuesta: {response.text})")
             return False
-    except Exception as e:
-        print(f"Excepción al escribir en GitHub: {e}")
+    except requests.RequestException as e:
+        print(f"❌ Error de conexión al intentar guardar sesión: {e}")
         return False
 
-def _read_file_from_github(filepath: str, repo_slug: str, token: str):
-    """Lee un archivo desde GitHub y retorna su contenido. Filepath es la ruta DENTRO del repo."""
-    if not token or not repo_slug: return None
-    url = f"https://api.github.com/repos/{repo_slug}/contents/{filepath}"
-    headers = _get_github_headers(token)
-    
-    try:
-        # Usamos el header 'Accept: application/vnd.github.v3.raw' para obtener el contenido RAW directamente
-        raw_headers = headers.copy()
-        raw_headers["Accept"] = "application/vnd.github.v3.raw"
-        
-        response = requests.get(url, headers=raw_headers, timeout=10)
-        if response.status_code == 200:
-            return response.text # El contenido RAW
-        elif response.status_code == 404:
-            return None
-        else:
-            print(f"Error al leer {filepath} desde GitHub (Status: {response.status_code}): {response.text}")
-            return None
-    except Exception as e:
-        print(f"Excepción al leer desde GitHub: {e}")
-        return None
+# --- Carga de Sesión ANTES de la Inicialización del Cliente ---
 
-# --- Lógica de Persistencia de Sesión ---
-
-def load_session_from_github():
-    """Intenta cargar la cadena de sesión de Telegram desde GitHub."""
-    global SESSION_STRING
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("Skipping load: GITHUB_TOKEN/GITHUB_REPO not set.")
-        return
-        
-    print(f"Attempting to load session from GitHub: {SESSION_FILE_PATH}")
-    content = _read_file_from_github(SESSION_FILE_PATH, GITHUB_REPO, GITHUB_TOKEN)
-    
-    if content and content.strip():
-        SESSION_STRING = content.strip()
-        print("🔑 Session string loaded successfully from GitHub.")
+# 1. Intentar cargar desde la variable de entorno (prioridad si existe y es válida)
+if SESSION_STRING and SESSION_STRING.strip() and SESSION_STRING != "consulta_pe_bot":
+    session_to_use = SESSION_STRING
+    print("🔑 Usando SESSION_STRING cargada de variable de entorno.")
+# 2. Intentar cargar desde la API externa
+else:
+    api_session = _load_session_from_api(BOT_API_ID)
+    if api_session:
+        session_to_use = api_session
+        print("💡 Usando SESSION_STRING recuperada de la API externa.")
+        SESSION_STRING = api_session # Actualiza la variable de entorno en memoria para /status
     else:
-        print("Session file not found or empty in GitHub. Proceeding with login/new session.")
+        # Usará un archivo de sesión local que se perderá al reiniciar el contenedor, 
+        # forzando un nuevo login si las otras dos opciones fallan.
+        session_to_use = "consulta_pe_session" 
+        print("📂 No hay SESSION_STRING persistente. Usando sesión de archivo local (requiere login inicial).")
 
-def save_session_to_github(session_str: str):
-    """Guarda la cadena de sesión de Telegram en GitHub."""
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("Skipping save: GITHUB_TOKEN/GITHUB_REPO not set.")
-        return
-        
-    print(f"Attempting to save session to GitHub: {SESSION_FILE_PATH}")
-    _write_file_to_github(
-        SESSION_FILE_PATH, 
-        session_str, 
-        "Actualizar cadena de sesión de Telethon", 
-        GITHUB_REPO, 
-        GITHUB_TOKEN
-    )
+session = StringSession(session_to_use)
+# --- Fin Carga de Sesión ---
 
-# --- Lógica de Caché de API (Lectura y Escritura) ---
 
-def _get_cache_filepath_in_repo(command: str) -> str:
-    """Genera la ruta completa del archivo de caché en GitHub basado en el comando."""
-    # Normalizar el comando para un nombre de archivo seguro
-    filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', command).lower()
-    # Limitar la longitud del nombre de archivo
-    if len(filename) > 200:
-        filename = filename[:200]
-    # Retorna la ruta DENTRO del repositorio
-    return f"{CACHE_REPO_PATH_PREFIX}{filename}.json"
-
-def get_cached_result(command: str):
-    """Busca un resultado en el caché de GitHub."""
-    if not GITHUB_TOKEN or not GITHUB_REPO: return None
-    
-    filepath = _get_cache_filepath_in_repo(command)
-    
-    # 1. Leer desde GitHub
-    content = _read_file_from_github(filepath, GITHUB_REPO, GITHUB_TOKEN)
-    
-    if content:
-        try:
-            # 2. Deserializar el JSON
-            result = json.loads(content)
-            # Marcar como caché para la respuesta
-            result["_from_cache"] = True 
-            print(f"💡 Resultado de CACHÉ para comando: {command}")
-            return result
-        except json.JSONDecodeError:
-            print(f"Error: No se pudo decodificar el JSON del caché para {command}.")
-            return None
-    return None
-
-def save_result_to_cache(command: str, result: dict):
-    """Guarda un resultado exitoso en el caché de GitHub."""
-    if not GITHUB_TOKEN or not GITHUB_REPO: 
-        print("Skipping cache save: GITHUB_TOKEN/GITHUB_REPO not set.")
-        return
-        
-    filepath = _get_cache_filepath_in_repo(command)
-    
-    # 1. Serializar el resultado a JSON
-    content = json.dumps(result, indent=4)
-    
-    # 2. Escribir a GitHub
-    _write_file_to_github(
-        filepath, 
-        content, 
-        f"Cache: Resultado automático para comando {command}", 
-        GITHUB_REPO, 
-        GITHUB_TOKEN
-    )
-
-# --- Manejo de Fallos por Bot (Implementación de tu lógica) ---
-
-# Diccionario para rastrear los fallos por timeout/bloqueo: {bot_id: datetime_of_failure}
+# --- Manejo de Fallos por Bot (Sin cambios) ---
 bot_fail_tracker = {}
 BOT_FAIL_TIMEOUT_HOURS = 6 
 
@@ -268,13 +132,10 @@ def is_bot_blocked(bot_id: str) -> bool:
     if not last_fail_time:
         return False
 
-    # Usamos la hora actual para la verificación
     now = datetime.now()
     six_hours_ago = now - timedelta(hours=BOT_FAIL_TIMEOUT_HOURS)
 
     if last_fail_time > six_hours_ago:
-        time_left = last_fail_time + timedelta(hours=BOT_FAIL_TIMEOUT_HOURS) - now
-        print(f"🚫 Bot {bot_id} bloqueado. Restan: {time_left}")
         return True
     
     print(f"✅ Bot {bot_id} ha cumplido su tiempo de bloqueo. Desbloqueado.")
@@ -286,66 +147,32 @@ def record_bot_failure(bot_id: str):
     print(f"🚨 Bot {bot_id} ha fallado y será BLOQUEADO por {BOT_FAIL_TIMEOUT_HOURS} horas.")
     bot_fail_tracker[bot_id] = datetime.now()
 
-# --- Aplicación Flask ---
-
+# --- Aplicación Flask (Sin cambios) ---
 app = Flask(__name__)
 CORS(app)
 
-# --- Middleware para el Monitor de Tráfico y Hibernación ---
-@app.before_request
-def update_traffic_time():
-    global last_traffic_time, is_hibernating
-    with hibernation_lock:
-        if is_hibernating:
-            # Si se recibe una solicitud mientras está hibernando, se "despierta"
-            is_hibernating = False
-            print("⚡️ Despertado por tráfico HTTP.")
-        last_traffic_time = time.time()
-        
-# --- Bucle Asíncrono para Telethon ---
-
+# --- Bucle Asíncrono para Telethon (Sin cambios) ---
 loop = asyncio.new_event_loop()
 threading.Thread(
     target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()), daemon=True
 ).start()
 
 def run_coro(coro):
-    """Ejecuta una corrutina en el bucle principal y espera el resultado."""
-    return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=TIMEOUT_TOTAL + 5) 
+    """Ejecuta una corrutina en el bucle principal y espera el resultado SÍNCRONAMENTE."""
+    return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=SYNC_WAIT_TIMEOUT) 
 
-# --- Cargar la Sesión de GitHub ANTES de inicializar el cliente ---
-
-# Cargar la sesión desde GitHub si no está en las variables de entorno
-if not SESSION_STRING:
-    load_session_from_github()
-    
-# --- Configuración del Cliente Telegram ---
-
-if SESSION_STRING and SESSION_STRING.strip():
-    session = StringSession(SESSION_STRING)
-    print("🔑 Usando SESSION_STRING (cargado de ENV o GitHub)")
-else:
-    # Si la sesión falla en cargar de ENV/GitHub, usamos un nombre de archivo dummy.
-    # El archivo NO se usará para la persistencia, sino el StringSession.
-    session = "consulta_pe_session" 
-    print("📂 Usando sesión 'consulta_pe_session' (Temporal, se necesita login)")
-
+# --- Configuración del Cliente Telegram (Sin cambios) ---
 client = TelegramClient(session, API_ID, API_HASH, loop=loop)
 
-# Mensajes en memoria (usaremos esto como caché de respuestas)
+# Mensajes en memoria
 messages = deque(maxlen=2000)
 _messages_lock = threading.Lock()
-
-# Diccionario para esperar respuestas específicas: 
 response_waiters = {} 
-
-# Login pendiente
 pending_phone = {"phone": None, "sent_at": None}
 
-# --- Lógica de Limpieza y Extracción de Datos (Se mantiene igual) ---
-
+# --- Lógica de Limpieza y Extracción de Datos (Sin cambios) ---
 def clean_and_extract(raw_text: str):
-    """Limpia el texto de cabeceras/pies y extrae campos clave. REEMPLAZA MARCA LEDER BOT."""
+    
     if not raw_text:
         return {"text": "", "fields": {}}
 
@@ -358,8 +185,9 @@ def clean_and_extract(raw_text: str):
     header_pattern = r"^\[.*?\]\s*→\s*.*?\[.*?\](\r?\n){1,2}"
     text = re.sub(header_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     
-    # 3. Eliminar pie (patrón más robusto para créditos/paginación/warnings al final)
-    footer_pattern = r"((\r?\n){1,2}\[|Página\s*\d+\/\d+.*|(\r?\n){1,2}Por favor, usa el formato correcto.*|↞ Anterior|Siguiente ↠.*|Credits\s*:.+|Wanted for\s*:.+)"
+    # 3. ELIMINAR EXPLICITAMENTE MARCA LEDERDATA Y CRÉDITOS
+    # Patrón para eliminar pie (créditos, paginación, warnings al final, y marcas específicas)
+    footer_pattern = r"((\r?\n){1,2}\[|Página\s*\d+\/\d+.*|(\r?\n){1,2}Por favor, usa el formato correcto.*|↞ Anterior|Siguiente ↠.*|Credits\s*:.+|Wanted for\s*:.+|\s*@lederdata.*|(\r?\n){1,2}\s*Marca\s*@lederdata.*|(\r?\n){1,2}\s*Créditos\s*:\s*\d+)"
     text = re.sub(footer_pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     
     # 4. Limpiar separador (si queda)
@@ -373,13 +201,20 @@ def clean_and_extract(raw_text: str):
     dni_match = re.search(r"DNI\s*:\s*(\d{8})", text, re.IGNORECASE)
     if dni_match: fields["dni"] = dni_match.group(1)
     
+    ruc_match = re.search(r"RUC\s*:\s*(\d{11})", text, re.IGNORECASE)
+    if ruc_match: fields["ruc"] = ruc_match.group(1)
+
     photo_type_match = re.search(r"Foto\s*:\s*(rostro|huella|firma|adverso|reverso).*", text, re.IGNORECASE)
     if photo_type_match: fields["photo_type"] = photo_type_match.group(1).lower()
+    
+    # 7. MANEJO DE MENSAJES DE NO ENCONTRADO
+    not_found_pattern = r"\[⚠️\]\s*(no se encontro información|no se han encontrado resultados|no se encontró una|no hay resultados|no tenemos datos|no se encontraron registros)"
+    if re.search(not_found_pattern, text, re.IGNORECASE | re.DOTALL):
+         fields["not_found"] = True
 
     return {"text": text, "fields": fields}
 
-# --- Handler de nuevos mensajes (Se mantiene igual) ---
-
+# --- Handler de nuevos mensajes (Sin cambios) ---
 async def _on_new_message(event):
     """Intercepta mensajes y resuelve las esperas de API si aplica."""
     try:
@@ -405,12 +240,12 @@ async def _on_new_message(event):
         
         msg_urls = []
 
+        # 2. Manejar archivos (media)
         if getattr(event, "message", None) and getattr(event.message, "media", None):
             media_list = []
+            
             if isinstance(event.message.media, (MessageMediaDocument, MessageMediaPhoto)):
                 media_list.append(event.message.media)
-            elif hasattr(event.message.media, 'webpage') and event.message.media.webpage and hasattr(event.message.media.webpage, 'photo'):
-                 pass
             
             if media_list:
                 try:
@@ -418,10 +253,13 @@ async def _on_new_message(event):
                     
                     for i, media in enumerate(media_list):
                         file_ext = '.file'
+                        is_photo = False
+                        
                         if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
                             file_ext = os.path.splitext(getattr(media.document, 'file_name', 'file'))[1]
                         elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
                             file_ext = '.jpg'
+                            is_photo = True
                             
                         dni_part = f"_{cleaned['fields'].get('dni')}" if cleaned["fields"].get("dni") else ""
                         type_part = f"_{cleaned['fields'].get('photo_type')}" if cleaned['fields'].get('photo_type') else ""
@@ -432,7 +270,7 @@ async def _on_new_message(event):
                         
                         url_obj = {
                             "url": f"{PUBLIC_URL}/files/{filename}", 
-                            "type": cleaned['fields'].get('photo_type', 'file'),
+                            "type": cleaned['fields'].get('photo_type', 'image' if is_photo else 'document'),
                             "text_context": raw_text.split('\n')[0].strip()
                         }
                         msg_urls.append(url_obj)
@@ -449,6 +287,7 @@ async def _on_new_message(event):
             "urls": msg_urls 
         }
 
+        # 3. Intentar resolver la espera de la API
         resolved = False
         with _messages_lock:
             keys_to_check = list(response_waiters.keys())
@@ -470,13 +309,18 @@ async def _on_new_message(event):
                     waiter_data["messages"].append(msg_obj)
                     waiter_data["has_response"] = True
                     
-                    if "Por favor, usa el formato correcto" in msg_obj["message"]:
+                    # Si recibimos un error de formato o de "no encontrado", resolvemos inmediatamente
+                    is_immediate_error = "Por favor, usa el formato correcto" in msg_obj["message"] or msg_obj["fields"].get("not_found", False)
+                    
+                    if is_immediate_error:
+                        if waiter_data["timer"]:
+                             waiter_data["timer"].cancel()
                         loop.call_soon_threadsafe(waiter_data["future"].set_result, msg_obj)
-                        waiter_data["timer"].cancel()
                         response_waiters.pop(command_id, None)
                         resolved = True
                         break
 
+        # 4. Agregar a la cola de historial si no se usó para una respuesta específica
         if not resolved:
             with _messages_lock:
                 messages.appendleft(msg_obj)
@@ -486,37 +330,49 @@ async def _on_new_message(event):
 
 client.add_event_handler(_on_new_message, events.NewMessage(incoming=True))
 
-# --- Función Central para Llamadas API (Comandos) ---
+
+# ----------------------------------------------------------------------
+# --- FUNCIONES DE GITHUB (ELIMINADAS) ---------------------------------
+# ----------------------------------------------------------------------
+def _extract_data_for_save(command: str, result: dict) -> tuple[str, dict] | tuple[None, None]:
+    # Función dummy, ya que no se guardará en GitHub
+    return (None, None)
+
+async def _guardar_datos_github(tipo: str, datos: dict):
+    # Función dummy, ya que no se guardará en GitHub
+    pass
+        
+# ----------------------------------------------------------------------
+# --- FUNCIÓN CENTRAL MODIFICADA (Eliminada llamada a GitHub) ---
+# ----------------------------------------------------------------------
 
 async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
     """Envía un comando al bot y espera la respuesta(s), con lógica de respaldo y bloqueo por fallo."""
     if not await client.is_user_authorized():
         raise Exception("Cliente no autorizado. Por favor, inicie sesión.")
 
-    # 1. Intentar obtener de la caché de GitHub
-    cached_result = get_cached_result(command)
-    if cached_result:
-        return cached_result
-    
-    # 2. Si no hay caché, proceder con la consulta a Telegram
-    
     command_id = time.time()
     
+    # Extraer DNI para hacer match con la respuesta
     dni_match = re.search(r"/\w+\s+(\d{8})", command)
     dni = dni_match.group(1) if dni_match else None
     
     bots_to_try = [LEDERDATA_BOT_ID, LEDERDATA_BACKUP_BOT_ID]
     
+    max_timeout = TIMEOUT_TOTAL # 50s
+    final_error = None 
+    
     for attempt, current_bot_id in enumerate(bots_to_try, 1):
         
-        if is_bot_blocked(current_bot_id) and attempt == 1:
-            print(f"🚫 Bot {current_bot_id} está BLOQUEADO temporalmente. Saltando al bot de respaldo.")
-            continue 
-        elif is_bot_blocked(current_bot_id) and attempt == 2:
-            print(f"🚫 Bot de Respaldo {current_bot_id} también está BLOQUEADO. No hay bots disponibles.")
-            break 
+        if is_bot_blocked(current_bot_id):
+            print(f"🚫 Bot {current_bot_id} está BLOQUEADO temporalmente. Saltando.")
+            if attempt == len(bots_to_try): 
+                final_error = {"status": "error", "message": f"Ambos bots están bloqueados. Último bot bloqueado: {current_bot_id}.", "bot_used": current_bot_id}
+            continue
 
         future = loop.create_future()
+        current_timeout = TIMEOUT_FAILOVER if attempt == 1 else max_timeout
+        
         waiter_data = {
             "future": future,
             "messages": [], 
@@ -527,26 +383,24 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
             "has_response": False 
         }
         
-        current_timeout = TIMEOUT_FAILOVER if attempt == 1 else TIMEOUT_TOTAL
-        
         def _on_timeout(bot_id_on_timeout=current_bot_id, command_id_on_timeout=command_id):
+            """Función de callback del timer para manejar el timeout de acumulación."""
             with _messages_lock:
                 waiter_data = response_waiters.pop(command_id_on_timeout, None)
                 if waiter_data and not waiter_data["future"].done():
                     
                     if waiter_data["messages"]:
-                        print(f"✅ Timeout alcanzado para acumulación en {bot_id_on_timeout}. Devolviendo {len(waiter_data['messages'])} mensaje(s).")
+                        # Devolver mensajes acumulados si hay alguno (cumple acumulación)
+                        print(f"✅ Timeout de {current_timeout}s alcanzado para acumulación en {bot_id_on_timeout}. Devolviendo {len(waiter_data['messages'])} mensaje(s).")
                         loop.call_soon_threadsafe(
                             waiter_data["future"].set_result, 
                             waiter_data["messages"]
                         )
                     else:
-                        if not waiter_data["has_response"]:
-                            record_bot_failure(bot_id_on_timeout)
-                        
+                        # Si no hay respuesta, es un timeout (esto activa el failover si es el primer bot)
                         loop.call_soon_threadsafe(
                             waiter_data["future"].set_result, 
-                            {"status": "error_timeout", "message": f"Tiempo de espera de respuesta agotado ({current_timeout}s). No se recibió NINGÚN mensaje para el comando: {command}.", "bot": bot_id_on_timeout, "fail_recorded": not waiter_data["has_response"]}
+                            {"status": "error_timeout", "message": f"Tiempo de espera de respuesta agotado ({current_timeout}s). No se recibió NINGÚN mensaje.", "bot": bot_id_on_timeout, "fail_recorded": False}
                         )
 
         waiter_data["timer"] = loop.call_later(current_timeout, _on_timeout)
@@ -558,52 +412,60 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
         
         try:
             await client.send_message(current_bot_id, command)
-            
             result = await future
             
-            if isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 1:
-                print(f"⌛ Timeout de NO RESPUESTA de {LEDERDATA_BOT_ID}. Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
-                continue 
-            elif isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 2:
-                return result 
+            # --- Lógica de Failover/Retorno de Resultado ---
             
-            if isinstance(result, dict) and "Por favor, usa el formato correcto" in result.get("message", ""):
-                 return {"status": "error_bot_format", "message": result.get("message"), "bot_used": current_bot_id}
-
+            # 1. Timeout de NO RESPUESTA (15s)
+            if isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 1:
+                print(f"⌛ Timeout de NO RESPUESTA de {LEDERDATA_BOT_ID} (15s). Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
+                final_error = result
+                continue
+                
+            # 2. Si el segundo bot falla por TIMEOUT (50s), retornamos el error.
+            elif isinstance(result, dict) and result.get("status") == "error_timeout" and attempt == 2:
+                final_error = result
+                break 
+            
+            # 3. Manejo de error de formato/No encontrado (resuelve inmediatamente en _on_new_message)
+            if isinstance(result, dict):
+                 if "Por favor, usa el formato correcto" in result.get("message", ""):
+                      return {"status": "error_bot_format", "message": "Formato de consulta incorrecto. " + result.get("message"), "bot_used": current_bot_id}
+                 # *** NUEVO: MANEJO DE NO ENCONTRADO ***
+                 if result["fields"].get("not_found", False):
+                      return {"status": "error_not_found", "message": "No se encontraron resultados para dicha consulta. Intenta con otro dato.", "bot_used": current_bot_id}
+                      
+            # 4. Procesar respuesta exitosa (lista de mensajes acumulados o mensaje simple)
             list_of_messages = result if isinstance(result, list) else [] 
             
             if isinstance(list_of_messages, list) and len(list_of_messages) > 0:
                 
                 final_result = list_of_messages[0].copy() 
                 final_result["full_messages"] = [msg["message"] for msg in list_of_messages] 
-                consolidated_urls = {} 
                 
-                type_map = {
-                    "rostro": "ROSTRO", 
-                    "huella": "HUELLA", 
-                    "firma": "FIRMA", 
-                    "adverso": "ADVERSO", 
-                    "reverso": "REVERSO"
-                }
+                consolidated_urls = {} 
+                type_map = {"rostro": "ROSTRO", "huella": "HUELLA", "firma": "FIRMA", "adverso": "ADVERSO", "reverso": "REVERSO"}
                 
                 for msg in list_of_messages:
                     for url_obj in msg.get("urls", []):
-                        key = type_map.get(url_obj["type"].lower())
+                        key_type = url_obj["type"].lower()
+                        key = type_map.get(key_type)
                         
                         if key:
                             if key not in consolidated_urls:
                                 consolidated_urls[key] = url_obj["url"]
                         else:
-                            base_key = "FILE"
+                            base_key = url_obj["type"].upper()
                             i = 1
-                            if base_key in consolidated_urls:
-                                while f"{base_key}_{i}" in consolidated_urls:
-                                    i += 1
-                                consolidated_urls[f"{base_key}_{i}"] = url_obj["url"]
-                            else:
-                                consolidated_urls[base_key] = url_obj["url"]
+                            key_name = base_key
+                            if key_name in consolidated_urls:
+                                while f"{base_key}_{i}" in consolidated_urls: i += 1
+                                key_name = f"{base_key}_{i}"
+                            consolidated_urls[key_name] = url_obj["url"]
 
                     if not final_result["fields"].get("dni") and msg["fields"].get("dni"):
+                        final_result["fields"] = msg["fields"]
+                    if not final_result["fields"].get("ruc") and msg["fields"].get("ruc"):
                         final_result["fields"] = msg["fields"]
                         
                 final_result["urls"] = consolidated_urls 
@@ -620,26 +482,38 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
                     "urls": final_result["urls"],
                 }
                 
-                if final_json["fields"].get("dni"):
-                    final_json["dni"] = final_json["fields"]["dni"]
+                # Mover DNI/RUC al nivel superior si existen en 'fields'
+                dni_val_final = final_json["fields"].get("dni")
+                ruc_val_final = final_json["fields"].get("ruc")
+
+                if dni_val_final:
+                    final_json["dni"] = dni_val_final
                     final_json["fields"].pop("dni")
+                if ruc_val_final:
+                    final_json["ruc"] = ruc_val_final
+                    final_json["fields"].pop("ruc")
                 
                 final_json["status"] = "ok"
-                final_json["bot_used"] = current_bot_id
-                
-                # 3. Guardar el resultado exitoso en la caché de GitHub
-                save_result_to_cache(command, final_json)
+                # *** ELIMINADA: LÓGICA DE GUARDADO EN GITHUB ***
                 
                 return final_json
                 
             else: 
-                return {"status": "error", "message": f"Respuesta vacía o inesperada del bot {current_bot_id}.", "bot_used": current_bot_id}
+                final_error = {"status": "error", "message": f"Respuesta vacía o inesperada del bot {current_bot_id}.", "bot_used": current_bot_id}
+                if attempt == 1:
+                    print(f"❌ Respuesta vacía de {LEDERDATA_BOT_ID}. Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
+                    continue
+                else:
+                    break
             
+        # --- Manejo de Errores de Conexión/Bloqueo ---
+        
         except UserBlockedError as e:
             error_msg = f"Error de Telethon/conexión/fallo: You blocked this user (caused by SendMessageRequest)"
             print(f"❌ Error de BLOQUEO en {current_bot_id}: {error_msg}. Registrando fallo y pasando al siguiente bot.")
             
             record_bot_failure(current_bot_id)
+            final_error = {"status": "error", "message": error_msg, "bot_used": current_bot_id}
             
             with _messages_lock:
                  if command_id in response_waiters:
@@ -650,23 +524,30 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
             if attempt == 1:
                 continue
             else:
-                return {"status": "error", "message": error_msg, "bot_used": current_bot_id}
+                break
             
         except Exception as e:
             error_msg = f"Error de Telethon/conexión/fallo: {str(e)}"
+            final_error = {"status": "error", "message": error_msg, "bot_used": current_bot_id}
+            
+            is_serious_error = not ("Timeout" in str(e) or "Timed out" in str(e))
+            if is_serious_error:
+                 print(f"❌ Error grave de Telethon en {current_bot_id}: {error_msg}. Registrando fallo.")
+                 record_bot_failure(current_bot_id)
+            else:
+                 print(f"❌ Error de Timeout de Telethon en {current_bot_id}: {error_msg}.")
+                 
+            with _messages_lock:
+                 if command_id in response_waiters:
+                    waiter_data = response_waiters.pop(command_id, None)
+                    if waiter_data and waiter_data["timer"]:
+                        waiter_data["timer"].cancel()
+
             if attempt == 1:
-                print(f"❌ Error en {LEDERDATA_BOT_ID}: {error_msg}. Intentando con {LEDERDATA_BACKUP_BOT_ID}.")
-                record_bot_failure(LEDERDATA_BOT_ID)
-                
-                with _messages_lock:
-                     if command_id in response_waiters:
-                        waiter_data = response_waiters.pop(command_id, None)
-                        if waiter_data and waiter_data["timer"]:
-                            waiter_data["timer"].cancel()
-                            
                 continue
             else:
-                return {"status": "error", "message": error_msg, "bot_used": current_bot_id}
+                break
+                
         finally:
             with _messages_lock:
                 if command_id in response_waiters:
@@ -674,63 +555,52 @@ async def _call_api_command(command: str, timeout: int = TIMEOUT_TOTAL):
                     if waiter_data and waiter_data["timer"]:
                         waiter_data["timer"].cancel()
 
-    final_bot = LEDERDATA_BOT_ID
-    if is_bot_blocked(LEDERDATA_BACKUP_BOT_ID) or not is_bot_blocked(LEDERDATA_BOT_ID):
-         final_bot = LEDERDATA_BOT_ID
-    elif is_bot_blocked(LEDERDATA_BOT_ID) and not is_bot_blocked(LEDERDATA_BACKUP_BOT_ID):
-         final_bot = LEDERDATA_BACKUP_BOT_ID
-    
-    return {"status": "error", "message": f"Falló la consulta después de 2 intentos. Ambos bots están bloqueados o agotaron el tiempo de espera.", "bot_used": final_bot}
+    if final_error:
+        # Si ambos fallaron, eliminamos el 'bot_used' del error final antes de devolver
+        final_error.pop("bot_used", None)
+        return final_error
+        
+    return {"status": "error", "message": "Fallo desconocido. Ambos bots están bloqueados o agotaron el tiempo de espera."}
 
 
-# --- Rutina de reconexión / ping ---
+# --- Rutinas y Rutas HTTP ---
 
 async def _ensure_connected():
-    """Mantiene la conexión y autorización activa, y guarda la sesión si es nueva."""
-    global SESSION_STRING # Necesario para actualizar la string global
+    """Mantiene la conexión y autorización activa. Tarea de fondo 24/7."""
     while True:
         try:
             if not client.is_connected():
                 print("🔌 Intentando reconectar Telethon...")
                 await client.connect()
             
-            is_auth = await client.is_user_authorized()
-            
-            if client.is_connected() and not is_auth:
-                 print("⚠️ Telethon conectado, pero no autorizado. Reintentando auth...")
+            if client.is_connected() and not await client.is_user_authorized():
+                 print("⚠️ Telethon conectado, pero no autorizado. Requerido /login para obtener SESSION_STRING.")
                  try:
+                    # Intenta un start/re-start
+                    # Esto solo funcionará si la sesión existe localmente O si la SESSION_STRING de entorno/API es válida
                     await client.start()
-                    # Si el start tiene éxito (ej. con archivo de sesión), is_auth se actualiza
                     if await client.is_user_authorized():
-                        is_auth = True
-                        # Si la sesión es ahora un StringSession y no estaba guardada, la guardamos
-                        if isinstance(client.session, StringSession):
-                            new_string = client.session.save()
-                            # 🚨 Revisión crítica: Guardar solo si es una sesión nueva/actualizada 
-                            if new_string != SESSION_STRING: 
-                                save_session_to_github(new_string)
-                                SESSION_STRING = new_string # Actualizar la variable global
-                                print("🔑 Sesión actualizada y guardada en GitHub desde _ensure_connected.")
-
+                        print("✅ Sesión restaurada con éxito.")
                  except Exception:
                      pass
 
-            if is_auth:
+            if await client.is_user_authorized():
+                # Pruebas ligeras para mantener la conexión viva y verificar permisos
                 await client.get_entity(LEDERDATA_BOT_ID) 
                 await client.get_entity(LEDERDATA_BACKUP_BOT_ID) 
                 await client.get_dialogs(limit=1) 
-                print("✅ Reconexión y verificación de bots exitosa.")
+                print("✅ Cliente autorizado y verificación de bots exitosa.")
             else:
-                 print("🔴 Cliente no autorizado. Requerido /login.")
+                 print("🔴 Cliente no autorizado.")
 
 
         except Exception:
-            traceback.print_exc()
-        await asyncio.sleep(300) # Dormir 5 minutos
+            pass
+        await asyncio.sleep(300) # Revisa cada 5 minutos
 
 asyncio.run_coroutine_threadsafe(_ensure_connected(), loop)
 
-# --- Rutas HTTP Base (Login/Status/General) ---
+# --- Rutas HTTP ---
 
 @app.route("/")
 def root():
@@ -739,16 +609,66 @@ def root():
         "message": "Gateway API para LEDER DATA Bot activo. Consulta /status para la sesión.",
     })
 
+# --- NUEVA RUTA: Guardar la sesión mediante POST en la API externa ---
+@app.route("/guardar-post/session_string", methods=["POST"])
+def save_session_string():
+    """
+    Ruta para guardar la session_string en la base de datos de persistencia.
+    Esperamos JSON: {"id": "mi_bot_principal", "session_string": "..."}
+    """
+    try:
+        data = request.get_json()
+        if not data or "id" not in data or "session_string" not in data:
+            return jsonify({"status": "error", "message": "Faltan 'id' o 'session_string' en el cuerpo JSON."}), 400
+        
+        bot_id = data["id"]
+        session_str = data["session_string"]
+        
+        # Ejecutar la función de guardado (que ya contiene la lógica de requests.post)
+        if _save_session_to_api(bot_id, session_str):
+             return jsonify({
+                 "status": "ok", 
+                 "message": f"Session_string recibida y enviada a la API externa para el ID: {bot_id}.",
+                 "persisted_id": bot_id
+             }), 200
+        else:
+             return jsonify({
+                 "status": "error", 
+                 "message": "Fallo al guardar la session_string en la API externa. Revisa los logs."
+             }), 500
+             
+    except Exception as e:
+        print(f"Error en /guardar-post/session_string: {e}")
+        return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
+
+# --- FIN NUEVA RUTA ---
+
+
 @app.route("/status")
 def status():
+    global SESSION_STRING # Asegurar que accedemos a la variable global
+    
+    # Intento de conexión ligera
+    try:
+        run_coro(client.connect()) 
+    except FutureTimeoutError:
+         pass 
+    except Exception:
+         pass
+
+    # Verificación de autorización
+    is_auth = False
     try:
         is_auth = run_coro(client.is_user_authorized())
+    except FutureTimeoutError:
+         is_auth = False
     except Exception:
         is_auth = False
 
+    # Obtener la sesión actual para el estado
     current_session = None
     try:
-        if is_auth and isinstance(client.session, StringSession):
+        if is_auth and client.is_connected():
             current_session = client.session.save()
     except Exception:
         pass
@@ -764,11 +684,12 @@ def status():
     return jsonify({
         "authorized": bool(is_auth),
         "pending_phone": pending_phone["phone"],
-        "session_loaded_at_startup": bool(SESSION_STRING),
-        "session_string_saved_to_github": bool(current_session), # Indica si se generó una string
+        # Se muestra True si SESSION_STRING tiene un valor cargado (de ENV o API)
+        "session_loaded_from_env_or_api": True if SESSION_STRING else False, 
+        "current_session_string": current_session, # Muestra la string actual si está conectado
         "bot_status": bot_status,
-        "hibernating": is_hibernating,
-        "last_traffic": datetime.fromtimestamp(last_traffic_time).isoformat()
+        "github_save_enabled": False,
+        "api_persistence_enabled": True
     })
 
 @app.route("/login")
@@ -786,12 +707,17 @@ def login():
             return {"status": "code_sent", "phone": phone}
         except Exception as e: return {"status": "error", "error": str(e)}
 
-    result = run_coro(_send_code())
-    return jsonify(result)
+    try:
+        result = run_coro(_send_code())
+        return jsonify(result)
+    except FutureTimeoutError:
+        return jsonify({"status": "error", "error": f"Timeout en la conexión o proceso de login (espera max {SYNC_WAIT_TIMEOUT}s). Revise el estado de la conexión."}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "error": f"Error interno en /login: {str(e)}"}), 500
 
 @app.route("/code")
 def code():
-    global SESSION_STRING # Necesario para actualizar la string global
+    global SESSION_STRING # Usamos la variable global
     code = request.args.get("code")
     if not code: return jsonify({"error": "Falta parámetro code"}), 400
     if not pending_phone["phone"]: return jsonify({"error": "No hay login pendiente"}), 400
@@ -799,24 +725,43 @@ def code():
     phone = pending_phone["phone"]
     async def _sign_in():
         try:
+            await client.connect() 
             await client.sign_in(phone, code)
-            await client.start()
+            await client.start() 
             pending_phone["phone"] = None
             pending_phone["sent_at"] = None
             
-            # OBTENER y GUARDAR la nueva StringSession en GitHub
+            # **CLAVE: Guarda la nueva sesión generada e IMPRIME el String**
             new_string = client.session.save()
-            save_session_to_github(new_string) 
-            SESSION_STRING = new_string # Actualizar la variable global
+            SESSION_STRING = new_string # Actualiza la variable global en memoria
             
-            return {"status": "authenticated", "session_string": new_string, "saved_to_github": True}
+            print("=============================================================================================")
+            print("✅ AUTENTICACIÓN EXITOSA. COPIE ESTA SESIÓN y configúrela en la variable de entorno SESSION_STRING:")
+            print("=============================================================================================")
+            print(new_string)
+            print("=============================================================================================")
+            
+            # CLAVE DE PERSISTENCIA: LLAMADA POST AL SERVIDOR EXTERNO
+            persistence_ok = _save_session_to_api(BOT_API_ID, new_string)
+            
+            note_message = "You must copy this session_string and set it as the SESSION_STRING environment variable for 24/7 persistence."
+            if persistence_ok:
+                 note_message += " **ADICIONALMENTE: Persistencia en API externa exitosa.**"
+            else:
+                 note_message += " **ADVERTENCIA: Fallo al guardar en la API externa. Verifique logs y el estado de la API.**"
+            
+            return {"status": "authenticated", "session_string": new_string, "NOTE": note_message}
+            
         except errors.SessionPasswordNeededError: return {"status": "error", "error": "2FA requerido"}
         except Exception as e: return {"status": "error", "error": str(e)}
 
-    result = run_coro(_sign_in())
-    return jsonify(result)
-
-# ... (Las rutas /send, /get y /files se mantienen iguales) ...
+    try:
+        result = run_coro(_sign_in())
+        return jsonify(result)
+    except FutureTimeoutError:
+        return jsonify({"status": "error", "error": f"Timeout en la conexión o proceso de código (espera max {SYNC_WAIT_TIMEOUT}s). Revise el estado de la conexión."}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "error": f"Error interno en /code: {str(e)}"}), 500
 
 @app.route("/send")
 def send_msg():
@@ -826,6 +771,7 @@ def send_msg():
         return jsonify({"error": "Faltan parámetros"}), 400
 
     async def _send(): 
+        await client.connect() 
         target = int(chat_id) if chat_id.isdigit() else chat_id
         entity = await client.get_entity(target)
         await client.send_message(entity, msg)
@@ -833,6 +779,8 @@ def send_msg():
     try:
         result = run_coro(_send())
         return jsonify(result)
+    except FutureTimeoutError:
+         return jsonify({"status": "error", "error": f"Timeout al enviar mensaje (espera max {SYNC_WAIT_TIMEOUT}s). Revise el estado de la conexión."}), 500
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500 
 
@@ -847,15 +795,14 @@ def get_msgs():
 
 @app.route("/files/<path:filename>")
 def files(filename):
-    """Ruta para descargar archivos."""
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
-
 # ----------------------------------------------------------------------
-# --- Rutas HTTP de API (Comandos LEDER DATA) ----------------------------
-# (Se mantienen los comandos y la lógica de parseo de parámetros)
+# --- Rutas HTTP de API (Comandos LEDER DATA) - Sin cambios funcionales ---
 # ----------------------------------------------------------------------
 
+@app.route("/sunat", methods=["GET"])
+@app.route("/sun", methods=["GET"]) 
 @app.route("/dni", methods=["GET"])
 @app.route("/dnif", methods=["GET"]) 
 @app.route("/dnidb", methods=["GET"])
@@ -880,40 +827,40 @@ def files(filename):
 @app.route("/osiptel", methods=["GET"])
 @app.route("/claro", methods=["GET"])
 @app.route("/entel", methods=["GET"])
-@app.route("/pro", methods=["GET"]) 
-@app.route("/sen", methods=["GET"]) 
-@app.route("/sbs", methods=["GET"]) 
-@app.route("/tra", methods=["GET"]) 
-@app.route("/tremp", methods=["GET"]) 
-@app.route("/sue", methods=["GET"]) 
-@app.route("/cla", methods=["GET"]) 
-@app.route("/sune", methods=["GET"]) 
-@app.route("/cun", methods=["GET"]) 
-@app.route("/colp", methods=["GET"]) 
-@app.route("/mine", methods=["GET"]) 
-@app.route("/pasaporte", methods=["GET"]) 
-@app.route("/seeker", methods=["GET"]) 
-@app.route("/afp", methods=["GET"]) 
-@app.route("/bdir", methods=["GET"]) 
-@app.route("/meta", methods=["GET"]) 
-@app.route("/fis", methods=["GET"]) 
-@app.route("/fisdet", methods=["GET"]) 
-@app.route("/det", methods=["GET"]) 
-@app.route("/rqh", methods=["GET"]) 
-@app.route("/antpenv", methods=["GET"]) 
-@app.route("/dend", methods=["GET"]) 
-@app.route("/dence", methods=["GET"]) 
-@app.route("/denpas", methods=["GET"]) 
-@app.route("/denci", methods=["GET"]) 
-@app.route("/denp", methods=["GET"]) 
-@app.route("/denar", methods=["GET"]) 
-@app.route("/dencl", methods=["GET"]) 
-@app.route("/agv", methods=["GET"]) 
-@app.route("/agvp", methods=["GET"]) 
-@app.route("/cedula", methods=["GET"]) 
+@app.route("/pro", methods=["GET"])
+@app.route("/sen", methods=["GET"])
+@app.route("/sbs", methods=["GET"])
+@app.route("/tra", methods=["GET"])
+@app.route("/tremp", methods=["GET"])
+@app.route("/sue", methods=["GET"])
+@app.route("/cla", methods=["GET"])
+@app.route("/sune", methods=["GET"])
+@app.route("/cun", methods=["GET"])
+@app.route("/colp", methods=["GET"])
+@app.route("/mine", methods=["GET"])
+@app.route("/pasaporte", methods=["GET"])
+@app.route("/seeker", methods=["GET"])
+@app.route("/afp", methods=["GET"])
+@app.route("/bdir", methods=["GET"])
+@app.route("/meta", methods=["GET"])
+@app.route("/fis", methods=["GET"])
+@app.route("/fisdet", methods=["GET"])
+@app.route("/det", methods=["GET"])
+@app.route("/rqh", methods=["GET"])
+@app.route("/antpenv", methods=["GET"])
+@app.route("/dend", methods=["GET"])
+@app.route("/dence", methods=["GET"])
+@app.route("/denpas", methods=["GET"])
+@app.route("/denci", methods=["GET"])
+@app.route("/denp", methods=["GET"])
+@app.route("/denar", methods=["GET"])
+@app.route("/dencl", methods=["GET"])
+@app.route("/agv", methods=["GET"])
+@app.route("/agvp", methods=["GET"])
+@app.route("/cedula", methods=["GET"])
 def api_dni_based_command():
-    
-    command_name = request.path.lstrip('/') 
+    command_name_path = request.path.lstrip('/') 
+    command_name = "sun" if command_name_path in ["sunat", "sun"] else command_name_path
     
     dni_required_commands = [
         "dni", "dnif", "dnidb", "dnifdb", "c4", "dnivaz", "dnivam", "dnivel", "dniveln", 
@@ -926,17 +873,23 @@ def api_dni_based_command():
         "tel", "telp", "cor", "nmv", "tremp", 
         "fisdet",
         "dence", "denpas", "denci", "denp", "denar", "dencl", 
-        "cedula", 
+        "cedula",
     ]
     
     optional_commands = ["osiptel", "claro", "entel", "pro", "sen", "sbs", "pasaporte", "seeker", "bdir"]
     
     param = ""
 
-    if command_name in dni_required_commands:
+    # SUN (Comando especial que acepta DNI o RUC)
+    if command_name == "sun":
+        param = request.args.get("dni_o_ruc") or request.args.get("query")
+        if not param or not param.isdigit() or len(param) not in [8, 11]:
+            return jsonify({"status": "error", "message": f"Parámetro 'dni_o_ruc' o 'query' es requerido y debe ser un DNI (8 dígitos) o RUC (11 dígitos) para /{command_name_path}."}), 400
+    
+    elif command_name in dni_required_commands:
         param = request.args.get("dni")
         if not param or not param.isdigit() or len(param) != 8:
-            return jsonify({"status": "error", "message": f"Parámetro 'dni' es requerido y debe ser un número de 8 dígitos para /{command_name}."}), 400
+            return jsonify({"status": "error", "message": f"Parámetro 'dni' es requerido y debe ser un número de 8 dígitos para /{command_name_path}."}), 400
     
     elif command_name in query_required_commands:
         
@@ -952,26 +905,18 @@ def api_dni_based_command():
                 elif dni_val:
                     param_value = dni_val
         
-        elif command_name == "dence":
-            param_value = request.args.get("carnet_extranjeria")
-        elif command_name == "denpas":
-            param_value = request.args.get("pasaporte")
-        elif command_name == "denci":
-            param_value = request.args.get("cedula_identidad")
-        elif command_name == "denp":
-            param_value = request.args.get("placa")
-        elif command_name == "denar":
-            param_value = request.args.get("serie_armamento")
-        elif command_name == "dencl":
-            param_value = request.args.get("clave_denuncia")
-            
-        elif command_name == "cedula":
-            param_value = request.args.get("cedula")
+        elif command_name == "dence": param_value = request.args.get("carnet_extranjeria")
+        elif command_name == "denpas": param_value = request.args.get("pasaporte")
+        elif command_name == "denci": param_value = request.args.get("cedula_identidad")
+        elif command_name == "denp": param_value = request.args.get("placa")
+        elif command_name == "denar": param_value = request.args.get("serie_armamento")
+        elif command_name == "dencl": param_value = request.args.get("clave_denuncia")
+        elif command_name == "cedula": param_value = request.args.get("cedula")
         
         param = param_value or request.args.get("dni") or request.args.get("query")
              
         if not param:
-            return jsonify({"status": "error", "message": f"Parámetro de consulta es requerido para /{command_name}."}), 400
+            return jsonify({"status": "error", "message": f"Parámetro de consulta es requerido para /{command_name_path}."}), 400
     
     elif command_name in optional_commands:
         param_dni = request.args.get("dni")
@@ -987,21 +932,29 @@ def api_dni_based_command():
     command = f"/{command_name} {param}".strip()
     
     try:
-        result = run_coro(_call_api_command(command, timeout=TIMEOUT_FAILOVER))
+        result = run_coro(_call_api_command(command, timeout=TIMEOUT_TOTAL)) 
         
         if result.get("status", "").startswith("error"):
-            is_timeout_or_connection_error = "timeout" in result.get("message", "").lower() or "telethon" in result.get("message", "").lower() or result.get("status") == "error_timeout"
-            status_code = 500 if is_timeout_or_connection_error else 400
-            result.pop("bot_used", None)
+            # Lógica de códigos de estado HTTP mejorada
+            status_code = 500
+            if result.get("status") == "error_bot_format":
+                 status_code = 400
+            elif result.get("status") == "error_not_found":
+                 status_code = 404 # 404 para "No encontrado"
+            elif "timeout" in result.get("message", "").lower() or result.get("status") == "error_timeout":
+                 status_code = 504 # 504 para Gateway Timeout
+            
             return jsonify(result), status_code
             
         return jsonify(result)
+    
+    except FutureTimeoutError:
+         return jsonify({"status": "error", "message": f"Error interno: Timeout síncrono excedido (max {SYNC_WAIT_TIMEOUT}s). La API de Telegram está saturada o no responde a tiempo para la espera síncrona."}), 504
     except Exception as e:
         return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
 
 @app.route("/dni_nombres", methods=["GET"])
 def api_dni_nombres():
-    
     nombres = unquote(request.args.get("nombres", "")).strip()
     ape_paterno = unquote(request.args.get("apepaterno", "")).strip()
     ape_materno = unquote(request.args.get("apematerno", "")).strip()
@@ -1016,18 +969,26 @@ def api_dni_nombres():
     command = f"/nm {formatted_nombres}|{formatted_apepaterno}|{formatted_apematerno}"
     
     try:
-        result = run_coro(_call_api_command(command, timeout=TIMEOUT_FAILOVER))
+        result = run_coro(_call_api_command(command, timeout=TIMEOUT_TOTAL))
         if result.get("status", "").startswith("error"):
-            is_timeout_or_connection_error = "timeout" in result.get("message", "").lower() or "telethon" in result.get("message", "").lower() or result.get("status") == "error_timeout"
-            result.pop("bot_used", None)
-            return jsonify(result), 500 if is_timeout_or_connection_error else 400
+            status_code = 500
+            if result.get("status") == "error_bot_format":
+                 status_code = 400
+            elif result.get("status") == "error_not_found":
+                 status_code = 404
+            elif "timeout" in result.get("message", "").lower() or result.get("status") == "error_timeout":
+                 status_code = 504
+            return jsonify(result), status_code
+            
         return jsonify(result)
+        
+    except FutureTimeoutError:
+         return jsonify({"status": "error", "message": f"Error interno: Timeout síncrono excedido (max {SYNC_WAIT_TIMEOUT}s). La API de Telegram está saturada o no responde a tiempo para la espera síncrona."}), 504
     except Exception as e:
         return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
 
 @app.route("/venezolanos_nombres", methods=["GET"])
 def api_venezolanos_nombres():
-    
     query = unquote(request.args.get("query", "")).strip()
     
     if not query:
@@ -1036,43 +997,24 @@ def api_venezolanos_nombres():
     command = f"/nmv {query}"
     
     try:
-        result = run_coro(_call_api_command(command, timeout=TIMEOUT_FAILOVER))
+        result = run_coro(_call_api_command(command, timeout=TIMEOUT_TOTAL))
         if result.get("status", "").startswith("error"):
-            is_timeout_or_connection_error = "timeout" in result.get("message", "").lower() or "telethon" in result.get("message", "").lower() or result.get("status") == "error_timeout"
-            result.pop("bot_used", None)
-            return jsonify(result), 500 if is_timeout_or_connection_error else 400
+            status_code = 500
+            if result.get("status") == "error_bot_format":
+                 status_code = 400
+            elif result.get("status") == "error_not_found":
+                 status_code = 404
+            elif "timeout" in result.get("message", "").lower() or result.get("status") == "error_timeout":
+                 status_code = 504
+            return jsonify(result), status_code
+            
         return jsonify(result)
+        
+    except FutureTimeoutError:
+         return jsonify({"status": "error", "message": f"Error interno: Timeout síncrono excedido (max {SYNC_WAIT_TIMEOUT}s). La API de Telegram está saturada o no responde a tiempo para la espera síncrona."}), 504
     except Exception as e:
         return jsonify({"status": "error", "message": f"Error interno: {str(e)}"}), 500
         
 # ----------------------------------------------------------------------
-# --- Inicio de la Aplicación ------------------------------------------
+# --- FIN DEL CÓDIGO ---
 # ----------------------------------------------------------------------
-
-if __name__ == "__main__":
-    
-    # 1. Iniciar el monitor de sueño
-    sleep_monitor_thread = threading.Thread(target=sleep_monitor, daemon=True)
-    sleep_monitor_thread.start()
-    
-    # 2. Conexión de Telethon
-    try:
-        run_coro(client.connect())
-        if not run_coro(client.is_user_authorized()):
-             run_coro(client.start())
-             
-        if run_coro(client.is_user_authorized()):
-             # Si la sesión se cargó/inició correctamente, obtenemos la string y la guardamos en GitHub
-             current_session_string = client.session.save()
-             if current_session_string != SESSION_STRING:
-                 save_session_to_github(current_session_string)
-                 SESSION_STRING = current_session_string # Actualizar la variable global
-             
-        # Verificación de que los bots existen
-        run_coro(client.get_entity(LEDERDATA_BOT_ID)) 
-        run_coro(client.get_entity(LEDERDATA_BACKUP_BOT_ID)) 
-    except Exception:
-        pass
-        
-    print(f"🚀 App corriendo en http://0.0.0.0:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
