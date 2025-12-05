@@ -1,34 +1,23 @@
-# fly.toml app configuration file generated for consulta-pe-telegram-bot-railway
+# fly.toml app configuration file generated for consulta-pe-telegram-bot-railway on 2025-12-05T22:49:07Z
 #
-# See https://fly.io/docs/reference/configuration/ for information about this file.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = "consulta-pe-telegram-bot-railway"
-primary_region = "gru" # Región primaria (Lima)
+app = 'consulta-pe-telegram-bot-railway'
+primary_region = 'gru'
 
-# [build] # <-- SECCIÓN ELIMINADA para que Fly.io use el Dockerfile
-#   builder = "paketobuildpacks/builder-jammy-base"
-#   buildpacks = ["gcr.io/paketo-buildpacks/python"]
+[build]
 
-[env]
-  # Variables de ambiente por defecto. Las sensibles van en Fly Secrets.
-  PORT = "8080" 
-
-# Configuración HTTP para exponer el puerto 8080
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
-  processes = ["app"]
-  
-  [http_service.concurrency]
-    type = "requests"
-    hard_limit = 25
-    soft_limit = 20
+  processes = ['app']
 
-# Montar un volumen persistente para la carpeta 'downloads'
-[mounts]
-  source="consulta_pe_volume" 
-  destination="/app/downloads"
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
