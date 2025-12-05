@@ -1,7 +1,7 @@
-requests
-pygithub
 flask
 flask-cors
 telethon
 aiohttp
 gunicorn
+requests
+PyGithub
